@@ -1,0 +1,248 @@
+---
+title: "Multinomial CI Prediction for 2020 Election"
+author: "Shanghao Zhong"
+date: "2020-11-06"
+output:
+  pdf_document: default
+  html_notebook: default
+---
+
+Load package
+```{r}
+library(jsonlite)
+library(lubridate)
+library(MultinomialCI)
+library(dplyr)
+```
+
+You also need to load the data. You should have the `all.state.dataset`.
+```{r}
+load("MultinomialCIProject2020.RData")
+all.state.dataset <- get('all.state.dataset')
+```
+
+
+## Predifine function
+
+The script concerns about the probability of a vote cast for a specific candidate.
+Assuming the votes follow a multinomial distribution, 
+it uses the `MultinomialCI` package to calculate the confidence interval
+of the probability for each candidate.
+
+```{r}
+#' Calculate county level multinomial c.i.
+#'
+#' @param df a data frame with vote counts. 
+#'           row.name is county name, 
+#'           and each column is the number of votes for each candidate.
+#' @param alpha The significance level for the confidence intervals. 
+#'              Must be a real number in the interval [0, 1]
+#' @return a data frame of confidence intervals for each candidate
+#' @export
+CI.by.county <- function(df, alpha) {
+  df <- filter(df, df[[1]] > 0)
+  candidate.names <- names(df)
+  county <- row.names(df)
+  mat <- t(apply(df, 1, as.numeric))
+  
+  CI.per.county <- function(vec) {
+    CI.per.county <- c(multinomialCI(pmax(vec, 0), alpha))
+  }
+  cols <- apply(expand.grid(candidate.names, c('low', 'high')), 1, paste, collapse='.')
+  all.ci <- t(apply(mat, 1, CI.per.county))
+  
+  output <- data.frame(all.ci, row.names = county)
+  colnames(output) <- cols
+  
+  return(output)
+}
+```
+
+With the probability of a vote cast for a candidate, the final projection is done by
+$np \pm z\cdot \sqrt{n\cdot p\cdot (1-p)}$, where $p$ is the probability of a candidate
+winning a vote, $n$ is the expected remaining vote according to NYT.
+
+```{r}
+#' Calculate the lower and the upper bound of the remaining votes given the 
+#' probability.
+#'
+#' @param remaining A scalar or vector containing the remaining votes in the 
+#'                  county.
+#' @param prob A scalar or vector containing the probability of votes going to 
+#'             the candidate in the county.
+#' @param alpha confidence level
+#'
+#' @return a length 2 vector, first is the lower bound and the second is the 
+#'         upper.
+#' @export
+range_est <- function(remaining, prob, alpha=0.95) {
+  lo <- remaining*prob + qnorm((1-alpha)/2)*sqrt(remaining*prob*(1-prob))
+  hi <- remaining*prob - qnorm((1-alpha)/2)*sqrt(remaining*prob*(1-prob))
+  return(c(sum(lo, na.rm = TRUE), sum(hi, na.rm = TRUE)))
+}
+```
+
+
+```{r}
+#' Helper function to convert UTC time string to EST
+#'
+#' @param timestring string representation of time, NYT's time in ISO format
+#'
+#' @return a POSIXct object in EST
+#' @export
+#'
+#' @examples to_EST('2020-11-07T01:46:10Z')
+to.EST <- function(timestring) {
+  with_tz(parse_date_time(timestring, 'ymd HMS'), 'EST')
+}
+```
+
+
+## Pull in data from NYT's api
+
+Need to change the `current.state.name` --- state name used to pull data from NYT's api.
+
+It should be spelled out and all lower case and whitespace should be replace by `-`.
+
+e.g. 
+
+- New York: `new-york`
+- Pennsylvania: `pennsylvania`
+- Distinct of Columbia: `district-of-columbia`
+
+It will store all the pulled data in `all.state.dataset`. Only new data will be stored.
+
+```{r}
+# This script will load data for the following state.
+current.state.name <- 'arizona'
+
+nyt.api <- paste(
+  'https://static01.nyt.com/elections-assets/2020/data/api/2020-11-03/race-page/', 
+  current.state.name, 
+  '/president.json',
+  sep = '')
+
+results <- fromJSON(nyt.api)
+current.update.time <- max(results$data$races$counties[[1]]$last_updated)
+
+# if the state haven't been track yet, create a slot for that.
+if (!current.state.name %in% names(all.state.dataset)) {
+  update.type <- "New data"
+  all.state.dataset[[current.state.name]] <- list()
+  all.state.dataset[[current.state.name]][[current.update.time]] <- results$data$races$counties[[1]]
+  previous.update.time <- 'N/A'
+} else { # if the state has been track, see if this one is new update
+  previous.update.time <- max(last(all.state.dataset[[current.state.name]])
+                              $last_updated)
+  if (current.update.time == previous.update.time) {
+    update.type <- "No update"
+  } else {
+    update.type <- "New update"
+    all.state.dataset[[current.state.name]][[current.update.time]] <- results$data$races$counties[[1]]
+  }
+}
+
+rm(results)
+
+by.county <- last(all.state.dataset[[current.state.name]])
+old.by.county <- nth(all.state.dataset[[current.state.name]], 
+                     max(1, length(all.state.dataset[[current.state.name]])-1))
+
+
+all.votes <- data.frame(by.county$results, 
+                        row.names = by.county$name)
+old.all.votes <- data.frame(old.by.county$results, 
+                            row.names = old.by.county$name)
+
+mail.votes <- data.frame(by.county$results_absentee, 
+                         row.names = by.county$name)
+old.mail.votes <- data.frame(old.by.county$results_absentee, 
+                             row.names = old.by.county$name)
+
+cat(paste(update.type, 'in', current.state.name),
+    paste("Previous Update:", 
+          to.EST(max(old.by.county$last_updated))),
+    paste("Current Update:", 
+          to.EST(max(by.county$last_updated))),
+    paste("Previous margin:", 
+          sum(old.all.votes$bidenj) - sum(old.all.votes$trumpd)),
+    paste("Current margin:", 
+          sum(all.votes$bidenj) - sum(all.votes$trumpd)),
+    sep='\n')
+```
+
+See the number of snapshots saved
+```{r}
+sapply(all.state.dataset, length)
+```
+
+See the time at which snapshots were taken (in EST)
+```{r}
+to.EST(names(all.state.dataset[[current.state.name]]))
+```
+
+
+## Estimate the probability for each candidate
+
+You can change `using` to update how you want to estimate the probability.
+Unhide one of them and hide to other to use.
+
+first option: 
+
+- Use the difference between old data and new data
+- Best for predicting the most recent trend
+- Doesn't work if the difference between old data and new data is small or non-representative
+
+second option: 
+
+- Use the mail.votes to predict old data and new data 
+- Work the best if the mail votes is homogeneous throughout different time
+- Doesn't work But the demographics within mail data can change over time
+
+When `using` is incomplete, the probability of each candidate will based on `all.votes`
+
+
+```{r}
+# first option
+using <- data.frame(
+  data.matrix(last(all.state.dataset[[current.state.name]])$results) 
+  - data.matrix(nth(all.state.dataset[[current.state.name]], 1)$results),
+  row.names = last(all.state.dataset[[current.state.name]])$name)
+
+# second option
+# using <- mail.votes
+
+remaining <- data.frame(exp.remaining = pmax(0, by.county$tot_exp_vote - rowSums(data.matrix(all.votes))), 
+                        row.names = by.county$name)
+ci.mail <- merge(remaining, CI.by.county(using, 0.95), by=0)
+ci.other <- merge(remaining, CI.by.county(all.votes, 0.95), by=0)
+ci.other <- ci.other[ci.other$Row.names %in% 
+                       setdiff(ci.other$Row.names, ci.mail$Row.names), ]
+est <- rbind(ci.mail, ci.other)
+rm(remaining)
+
+est <- est[order(est$Row.names), ]
+rownames(est) <- est$Row.names
+est$Row.names <- NULL
+est[est$exp.remaining > 0, ]
+```
+
+
+## Estimate the final range
+
+With the lower and upper bound of Biden's and Trump's probability in a county,
+we use both probability to calculate the CI. 
+The lower end of the CI from the low probability is a candidate's lower bound,
+while the upper end of the CI from the high probility is a candidate's upper bound.
+We then see the margin using Biden's lower bound $-$ Trump's upper bound, 
+and using Biden's upper bound $-$ Trump's lower bound, to calculate the final projection interval.
+
+```{r}
+future.lo <- range_est(est$exp.remaining, est$bidenj.low)[1] - range_est(est$exp.remaining, est$trumpd.high)[2]
+future.hi <- range_est(est$exp.remaining, est$bidenj.high)[2] - range_est(est$exp.remaining, est$trumpd.low)[1]
+current.diff <- sum(all.votes$bidenj) - sum(all.votes$trumpd)
+current.diff + c(future.lo, future.hi)
+```
+
+
+
