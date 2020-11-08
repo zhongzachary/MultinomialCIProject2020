@@ -15,10 +15,11 @@ library(MultinomialCI)
 library(dplyr)
 ```
 
-You also need to load the data. You should have the `all.state.dataset`.
+You also need to load the data. You should have the `all.state.dataset` ready when data is load correctly.
 ```{r}
 load("MultinomialCIProject2020.RData")
 all.state.dataset <- get('all.state.dataset')
+summary(all.state.dataset)
 ```
 
 
@@ -63,7 +64,7 @@ $np \pm z\cdot \sqrt{n\cdot p\cdot (1-p)}$, where $p$ is the probability of a ca
 winning a vote, $n$ is the expected remaining vote according to NYT.
 
 ```{r}
-#' Calculate the lower and the upper bound of the remaining votes given the 
+#' Calculate prediction interval of the remaining votes given the 
 #' probability.
 #'
 #' @param remaining A scalar or vector containing the remaining votes in the 
@@ -75,10 +76,10 @@ winning a vote, $n$ is the expected remaining vote according to NYT.
 #' @return a length 2 vector, first is the lower bound and the second is the 
 #'         upper.
 #' @export
-range_est <- function(remaining, prob, alpha=0.95) {
+p.interval <- function(remaining, prob, alpha=0.95) {
   lo <- remaining*prob + qnorm((1-alpha)/2)*sqrt(remaining*prob*(1-prob))
   hi <- remaining*prob - qnorm((1-alpha)/2)*sqrt(remaining*prob*(1-prob))
-  return(c(sum(lo, na.rm = TRUE), sum(hi, na.rm = TRUE)))
+  return(c(lo = sum(lo, na.rm = TRUE), hi = sum(hi, na.rm = TRUE)))
 }
 ```
 
@@ -97,78 +98,142 @@ to.EST <- function(timestring) {
 }
 ```
 
+More helper functions to pull data from NYT.
 
-## Pull in data from NYT's api
-
-Need to change the `current.state.name` --- state name used to pull data from NYT's api.
-
-It should be spelled out and all lower case and whitespace should be replace by `-`.
-
-e.g. 
-
-- New York: `new-york`
-- Pennsylvania: `pennsylvania`
-- Distinct of Columbia: `district-of-columbia`
-
-It will store all the pulled data in `all.state.dataset`. Only new data will be stored.
+- `collect.data(dataset, state)` pulls data from NYT.
+- `get.state.data(dataset, state, index)` gets historic data of a state.
+- `load.state.data(state.data, names)` saves state data into global environment.
 
 ```{r}
-# This script will load data for the following state.
-current.state.name <- 'arizona'
-
-nyt.api <- paste(
-  'https://static01.nyt.com/elections-assets/2020/data/api/2020-11-03/race-page/', 
-  current.state.name, 
-  '/president.json',
-  sep = '')
-
-results <- fromJSON(nyt.api)
-current.update.time <- max(results$data$races$counties[[1]]$last_updated)
-
-# if the state haven't been track yet, create a slot for that.
-if (!current.state.name %in% names(all.state.dataset)) {
-  update.type <- "New data"
-  all.state.dataset[[current.state.name]] <- list()
-  all.state.dataset[[current.state.name]][[current.update.time]] <- results$data$races$counties[[1]]
-  previous.update.time <- 'N/A'
-} else { # if the state has been track, see if this one is new update
-  previous.update.time <- max(last(all.state.dataset[[current.state.name]])
-                              $last_updated)
-  if (current.update.time == previous.update.time) {
-    update.type <- "No update"
-  } else {
-    update.type <- "New update"
-    all.state.dataset[[current.state.name]][[current.update.time]] <- results$data$races$counties[[1]]
+#' Collect data from NYT of the given state and return the updated dataset.
+#'
+#' @param dataset The dataset that store all previously pull data. 
+#'                It should be a list of all tracked states, 
+#'                  each is another list that contains historical snapshot.
+#' @param state What state we want to get the data for. 
+#'              White spaces should be replaced by `-`.
+#'              For example, New York should be `new-york`,
+#'                Pennsylvania should be `pennsylvania`, and
+#'                D.C. should be `district-of-columbia`.
+#'
+#' @return The updated dataset, in which the new data is appended at the end of 
+#'           its state list.
+#' @export
+#'
+#' @examples 
+#' # this will read arizona data, update the dataset, and assign it back.
+#' all.state.dataset %>% collect.data('arizona') -> all.state.dataset
+collect.data <- function(dataset, state) {
+  nyt.api <- paste(
+    'https://static01.nyt.com/elections-assets/2020/data/api/2020-11-03/race-page/', 
+    state, 
+    '/president.json',
+    sep = '')
+  
+  results <- fromJSON(nyt.api)
+  current.time <- max(results$data$races$counties[[1]]$last_updated)
+  
+  if (!state %in% names(dataset)) {
+    update.type <- "New state"
+    dataset[[state]] <- list()
+    dataset[[state]][[current.time]] <- results$data$races$counties[[1]]
+  } else { # if the state has been track, see if this one is new update
+    previous.time <- max(last(dataset[[state]])$last_updated)
+    if (current.time == previous.time) {
+      update.type <- "No update"
+    } else {
+      update.type <- "New update"
+      dataset[[state]][[current.time]] <- results$data$races$counties[[1]]
+    }
   }
+  
+  cat(paste(state, ":", update.type),
+      paste("Update time:", to.EST(current.time)),
+      paste("Current margin for Biden:",
+            sum(last(dataset[[state]])$results$bidenj) 
+            - sum(last(dataset[[state]])$results$trumpd)),
+      sep='\n')
+  
+  return(dataset)
 }
 
-rm(results)
 
-by.county <- last(all.state.dataset[[current.state.name]])
-old.by.county <- nth(all.state.dataset[[current.state.name]], 
-                     max(1, length(all.state.dataset[[current.state.name]])-1))
+#' Get a state's data of a historic snapshot.
+#'
+#' @param dataset The dataset that stores all state's data
+#' @param state The state of which you are getting the data
+#' @param index The index of the historical snapshot of this state. 
+#'              The latest snapshot will be pulled by default.
+#'
+#' @return 
+#' a list containing 3 elements: 
+#' - `state.details`: all the details of this snapshot, by county,
+#' - `all.votes`: all vote counts of each candidate, by county, and
+#' - `mail.votes`: mail vote counts of each candidate, by county.
+#'
+#' @export
+#'
+#' @examples
+#' all.state.dataset %>% get.state.data('arizona')
+get.state.data <- function(dataset, state, index = NULL) {
+  state.data <- dataset[[state]]
+  if (is.null(index)) {
+    index <- length(state.data)
+  }
+  state.details <- state.data[[index]]
+  
+  cat('Get state data for', state, 
+      paste('(updated at: ', to.EST(max(state.details$last_updated)), ').\n', 
+            sep = ''))
+  
+  return(list(
+    state.details = state.details,
+    all.votes = data.frame(state.details$results, 
+                            row.names = state.details$name),
+    mail.votes = data.frame(state.details$results_absentee, 
+                             row.names = state.details$name)
+  ))
+}
 
+#' Load state data into global environment.
+#'
+#' @param state.data The state data, usually the return from `get.state.data`
+#' @param names The global variable names to store `state.details`, `all.votes`, 
+#'                and `mail.votes` from `state.data`
+#'
+#' @return NULL
+#' @export
+#'
+#' @examples 
+#' # load latest data
+#' get.state.data(all.state.dataset, current.state.name) %>% load.state.data()
+#' # load first snapshot
+#' get.state.data(all.state.dataset, current.state.name, 1) %>%
+#'   load.state.data(c('old.state.details', 'old.all.votes', 'old.mail.votes'))
+load.state.data <- function(state.data, names = c('state.details', 
+                                                  'all.votes', 
+                                                  'mail.votes')) {
+  if(length(names) != 3 & typeof(names) != 'character') {
+    stop('names should be a character vector with 3 elements.')
+  }
+  assign(names[1], state.data$state.details, envir = .GlobalEnv, inherits = TRUE)
+  assign(names[2], state.data$all.votes, envir = .GlobalEnv, inherits = TRUE)
+  assign(names[3], state.data$mail.votes, envir = .GlobalEnv, inherits = TRUE)
+  cat('State data are loaded in: ', 
+      paste(names, collapse = ', '), 
+      '.\n', 
+      sep = '')
+}
+```
 
-all.votes <- data.frame(by.county$results, 
-                        row.names = by.county$name)
-old.all.votes <- data.frame(old.by.county$results, 
-                            row.names = old.by.county$name)
-
-mail.votes <- data.frame(by.county$results_absentee, 
-                         row.names = by.county$name)
-old.mail.votes <- data.frame(old.by.county$results_absentee, 
-                             row.names = old.by.county$name)
-
-cat(paste(update.type, 'in', current.state.name),
-    paste("Previous Update:", 
-          to.EST(max(old.by.county$last_updated))),
-    paste("Current Update:", 
-          to.EST(max(by.county$last_updated))),
-    paste("Previous margin:", 
-          sum(old.all.votes$bidenj) - sum(old.all.votes$trumpd)),
-    paste("Current margin:", 
-          sum(all.votes$bidenj) - sum(all.votes$trumpd)),
-    sep='\n')
+## Pull data
+Pull new data from a state from NYT's API.
+`current.state.name` needs to be the fully spelled name in lowercase in which spaces is replaced by `-`.
+For example, New York will be `new-york`; Pennsylvania will be `pennsylvania`, and D.C. will be `district-of-columbia`.
+```{r}
+current.state.name <- 'arizona'
+all.state.dataset %>% collect.data(current.state.name) -> all.state.dataset
+all.state.dataset %>% get.state.data(current.state.name) %>% load.state.data()
 ```
 
 See the number of snapshots saved
@@ -205,15 +270,15 @@ When `using` is incomplete, the probability of each candidate will based on `all
 ```{r}
 # first option
 using <- data.frame(
-  data.matrix(last(all.state.dataset[[current.state.name]])$results) 
-  - data.matrix(nth(all.state.dataset[[current.state.name]], 1)$results),
-  row.names = last(all.state.dataset[[current.state.name]])$name)
+  data.matrix(get.state.data(all.state.dataset, current.state.name)$all.votes)
+  - data.matrix(get.state.data(all.state.dataset, current.state.name, 1)$all.votes),
+  row.names = get.state.data(all.state.dataset, current.state.name)$state.details$name)
 
 # second option
-# using <- mail.votes
+# using <- get.state.data(all.state.dataset, current.state.name)$mail.votes
 
-remaining <- data.frame(exp.remaining = pmax(0, by.county$tot_exp_vote - rowSums(data.matrix(all.votes))), 
-                        row.names = by.county$name)
+remaining <- data.frame(exp.remaining = pmax(0, state.details$tot_exp_vote - rowSums(data.matrix(all.votes))), 
+                        row.names = state.details$name)
 ci.mail <- merge(remaining, CI.by.county(using, 0.95), by=0)
 ci.other <- merge(remaining, CI.by.county(all.votes, 0.95), by=0)
 ci.other <- ci.other[ci.other$Row.names %in% 
@@ -238,11 +303,15 @@ We then see the margin using Biden's lower bound $-$ Trump's upper bound,
 and using Biden's upper bound $-$ Trump's lower bound, to calculate the final projection interval.
 
 ```{r}
-future.lo <- range_est(est$exp.remaining, est$bidenj.low)[1] - range_est(est$exp.remaining, est$trumpd.high)[2]
-future.hi <- range_est(est$exp.remaining, est$bidenj.high)[2] - range_est(est$exp.remaining, est$trumpd.low)[1]
+future.lo <- p.interval(est$exp.remaining, est$bidenj.low)[1] - p.interval(est$exp.remaining, est$trumpd.high)[2]
+future.hi <- p.interval(est$exp.remaining, est$bidenj.high)[2] - p.interval(est$exp.remaining, est$trumpd.low)[1]
 current.diff <- sum(all.votes$bidenj) - sum(all.votes$trumpd)
 current.diff + c(future.lo, future.hi)
 ```
 
 
+Saving the data
+```{r}
+save.image("MultinomialCIProject2020.RData")
+```
 
