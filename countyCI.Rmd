@@ -7,17 +7,26 @@ output:
   html_notebook: default
 ---
 
+## Required package and `RData`
+
 Load package
+
 ```{r}
 library(jsonlite)
 library(lubridate)
 library(MultinomialCI)
 library(dplyr)
+library(purrr)
 ```
 
-You also need to load the data. You should have the `all.state.dataset` ready when data is load correctly.
+You also need to load the data. 
+You should have the `all.state.dataset` ready when data is load correctly.
+
+Note: you might need to upgrade R to load this `RData` correctly.
+
 ```{r}
 load("MultinomialCIProject2020.RData")
+# set thsi to `list()` if you want to start fresh
 all.state.dataset <- get('all.state.dataset')
 summary(all.state.dataset)
 ```
@@ -25,7 +34,9 @@ summary(all.state.dataset)
 
 ## Predifine function
 
-The script concerns about the probability of a vote cast for a specific candidate.
+### Confidence interval and prediction interval calculation
+
+The model concerns about the probability of a vote cast for a specific candidate.
 Assuming the votes follow a multinomial distribution, 
 it uses the `MultinomialCI` package to calculate the confidence interval
 of the probability for each candidate.
@@ -40,7 +51,7 @@ of the probability for each candidate.
 #'              Must be a real number in the interval [0, 1]
 #' @return a data frame of confidence intervals for each candidate
 #' @export
-CI.by.county <- function(df, alpha) {
+CI.by.county <- function(df, alpha=0.05) {
   df <- filter(df, df[[1]] > 0)
   candidate.names <- names(df)
   county <- row.names(df)
@@ -76,33 +87,21 @@ winning a vote, $n$ is the expected remaining vote according to NYT.
 #' @return a length 2 vector, first is the lower bound and the second is the 
 #'         upper.
 #' @export
-p.interval <- function(remaining, prob, alpha=0.95) {
-  lo <- remaining*prob + qnorm((1-alpha)/2)*sqrt(remaining*prob*(1-prob))
-  hi <- remaining*prob - qnorm((1-alpha)/2)*sqrt(remaining*prob*(1-prob))
+p.interval <- function(remaining, prob, alpha=0.05) {
+  lo <- remaining*prob + qnorm((alpha)/2)*sqrt(remaining*prob*(1-prob))
+  hi <- remaining*prob - qnorm((alpha)/2)*sqrt(remaining*prob*(1-prob))
   return(c(lo = sum(lo, na.rm = TRUE), hi = sum(hi, na.rm = TRUE)))
 }
 ```
 
-
-```{r}
-#' Helper function to convert UTC time string to EST
-#'
-#' @param timestring string representation of time, NYT's time in ISO format
-#'
-#' @return a POSIXct object in EST
-#' @export
-#'
-#' @examples to_EST('2020-11-07T01:46:10Z')
-to.EST <- function(timestring) {
-  with_tz(parse_date_time(timestring, 'ymd HMS'), 'EST')
-}
-```
+### Helper functions to pull data from NYT
 
 More helper functions to pull data from NYT.
 
 - `collect.data(dataset, state)` pulls data from NYT.
 - `get.state.data(dataset, state, index)` gets historic data of a state.
 - `load.state.data(state.data, names)` saves state data into global environment.
+- `to.EST(timestring)` converts a string (ISO format in UTC) to EST.
 
 ```{r}
 #' Collect data from NYT of the given state and return the updated dataset.
@@ -224,76 +223,106 @@ load.state.data <- function(state.data, names = c('state.details',
       '.\n', 
       sep = '')
 }
+
+
+#' Helper function to convert UTC time string to EST
+#'
+#' @param timestring string representation of time, NYT's time in ISO format
+#'
+#' @return a POSIXct object in EST
+#' @export
+#'
+#' @examples to_EST('2020-11-07T01:46:10Z')
+to.EST <- function(timestring) {
+  with_tz(parse_date_time(timestring, 'ymd HMS'), 'EST')
+}
 ```
 
-## Pull data
-Pull new data from a state from NYT's API.
-`current.state.name` needs to be the fully spelled name in lowercase in which spaces is replaced by `-`.
-For example, New York will be `new-york`; Pennsylvania will be `pennsylvania`, and D.C. will be `district-of-columbia`.
-```{r}
-current.state.name <- 'arizona'
-all.state.dataset %>% collect.data(current.state.name) -> all.state.dataset
-all.state.dataset %>% get.state.data(current.state.name) %>% load.state.data()
-```
+### Functions to build estimate
 
-See the number of snapshots saved
-```{r}
-sapply(all.state.dataset, length)
-```
+To produce the final estimated range, we need
 
-See the time at which snapshots were taken (in EST)
-```{r}
-to.EST(names(all.state.dataset[[current.state.name]]))
-```
-
-
-## Estimate the probability for each candidate
-
-You can change `using` to update how you want to estimate the probability.
-Unhide one of them and hide to other to use.
-
-first option: 
-
-- Use the difference between old data and new data
-- Best for predicting the most recent trend
-- Doesn't work if the difference between old data and new data is small or non-representative
-
-second option: 
-
-- Use the mail.votes to predict old data and new data 
-- Work the best if the mail votes is homogeneous throughout different time
-- Doesn't work But the demographics within mail data can change over time
-
-When `using` is incomplete, the probability of each candidate will based on `all.votes`
-
+- `vote.diff`: calculate the difference between two snapshots for a states
+- `rbind.exclude.dup`: like `rbind` but exclude row with duplicate row names. useful to combine vote differences, mail vote counts, and all vote counts to calculation probability C.I.
+- `build.est`: build estimated probability given the votes count. Vote difference will be used first to show the most recent trend, then mail vote counts if vote difference is not available, and at the end all vote counts. Estimated expected vote remaining is from NYT's data.
 
 ```{r}
-# first option
-using <- data.frame(
-  data.matrix(get.state.data(all.state.dataset, current.state.name)$all.votes)
-  - data.matrix(get.state.data(all.state.dataset, current.state.name, 1)$all.votes),
-  row.names = get.state.data(all.state.dataset, current.state.name)$state.details$name)
+#' Calculate the vote difference between the new snapshot and the old snapshot.
+#'
+#' @param dataset `all.state.dataset`
+#' @param state state name
+#' @param index.old the index of the old snapshot
+#' @param index.new the index of the new snapshot. if omitted, the latest will be used.
+#' @param type either 'all.votes' or 'mail.votes'
+#'
+#' @return a data frame contains the vote difference for each candidate by county.
+#' @export
+#'
+#' @examples all.state.dataset %>% vote.diff('arizona')
+vote.diff <- function(dataset, state, index.old, index.new = NULL, type='all.votes') {
+  if (is.null(index.new)) {
+    index.new <- length(dataset[[state]])
+  }
+  new.votes <- get.state.data(dataset, state, index.new)[[type]]
+  old.votes <- get.state.data(dataset, state, index.old)[[type]]
+  return(data.frame(data.matrix(new.votes) - data.matrix(old.votes), 
+                    row.names = rownames(new.votes)))
+}
 
-# second option
-# using <- get.state.data(all.state.dataset, current.state.name)$mail.votes
 
-remaining <- data.frame(exp.remaining = pmax(0, state.details$tot_exp_vote - rowSums(data.matrix(all.votes))), 
-                        row.names = state.details$name)
-ci.mail <- merge(remaining, CI.by.county(using, 0.95), by=0)
-ci.other <- merge(remaining, CI.by.county(all.votes, 0.95), by=0)
-ci.other <- ci.other[ci.other$Row.names %in% 
-                       setdiff(ci.other$Row.names, ci.mail$Row.names), ]
-est <- rbind(ci.mail, ci.other)
-rm(remaining)
+#' Combine 2 data frame by rows,but only keep the first occurrence of 2 rows 
+#' with the same row name.
+#'
+#' @param df original data frame
+#' @param df.new new data frame, only rows with new row name will be added.
+#'
+#' @return a new data frame
+#' @export
+rbind.exclude.dup <- function(df, df.new) {
+  rbind(df, df.new)[!duplicated(c(rownames(df), rownames(df.new))), ]
+}
 
-est <- est[order(est$Row.names), ]
-rownames(est) <- est$Row.names
-est$Row.names <- NULL
-est[est$exp.remaining > 0, ]
+
+#' Build estimate of a state. Candidate's probability CI will be calculated based
+#' on vote changes, then mail votes, and lastly all votes.
+#'
+#' @param dataset all.state.dataset
+#' @param state state name
+#' @param index.ref index of the reference snapshot, used to get the vote difference with `index.cur`. 
+#'                  when omitted, the first snapshot will be used.
+#' @param index.cur index of the current snapshot, used to get the current votes count and remaining votes.
+#'                  when omitted, the latest snapshot will be used.
+#' @param alpha alpha used in `MultinomialCI::multinomialCI`
+#'
+#' @return a data frame contained the expected remaining votes and CI for each candidate's probability.
+#' @export
+build.est <- function(dataset, state, index.ref = 1, index.cur = NULL, alpha=0.05) {
+  if (is.null(index.cur)) {
+    index.cur <- length(dataset[[state]])
+  }
+  
+  state.data.cur <- get.state.data(dataset, state, index.cur)
+  
+  using <- list(vote.diff(dataset, state, index.ref, index.cur),
+                state.data.cur$mail.votes,
+                state.data.cur$all.votes)
+  
+  using %>% lapply(CI.by.county) %>% reduce(rbind.exclude.dup) -> ci
+  
+  remaining <- data.frame(
+    exp.remaining = pmax(0, state.data.cur$state.details$tot_exp_vote 
+                         - rowSums(data.matrix(state.data.cur$all.votes))),
+    row.names = state.data.cur$state.details$name)
+  
+  est <- merge(remaining, ci, by=0)
+  est <- est[order(est$Row.names), ]
+  rownames(est) <- est$Row.names
+  est$Row.names <- NULL
+  return(est)
+}
 ```
 
-
-## Estimate the final range
+### Estimate the final range
 
 With the lower and upper bound of Biden's and Trump's probability in a county,
 we use both probability to calculate the CI. 
@@ -303,14 +332,69 @@ We then see the margin using Biden's lower bound $-$ Trump's upper bound,
 and using Biden's upper bound $-$ Trump's lower bound, to calculate the final projection interval.
 
 ```{r}
-future.lo <- p.interval(est$exp.remaining, est$bidenj.low)[1] - p.interval(est$exp.remaining, est$trumpd.high)[2]
-future.hi <- p.interval(est$exp.remaining, est$bidenj.high)[2] - p.interval(est$exp.remaining, est$trumpd.low)[1]
-current.diff <- sum(all.votes$bidenj) - sum(all.votes$trumpd)
-current.diff + c(future.lo, future.hi)
+build.final.range <- function(est) {
+  future.lo <- p.interval(est$exp.remaining, est$bidenj.low)[1] - p.interval(est$exp.remaining, est$trumpd.high)[2]
+  future.hi <- p.interval(est$exp.remaining, est$bidenj.high)[2] - p.interval(est$exp.remaining, est$trumpd.low)[1]
+  current.diff <- sum(all.votes$bidenj) - sum(all.votes$trumpd)
+  return(c(
+    'est.final' = current.diff + c(future.lo, future.hi),
+    'current.diff' = current.diff
+  ))
+}
 ```
 
 
-Saving the data
+## Running to model
+
+### Pull data
+
+Pull new data from a state from NYT's API.
+
+`tracking.states` includes a vector of all states of which we want to pull data.
+State name should be fully spelled in lower case, and white spaces should be replaced
+by `-`. For example, New York will be `new-york`; Pennsylvania will be `pennsylvania`, and D.C. will be `district-of-columbia`.
+
+```{r}
+tracking.states <- c('arizona', 'pennsylvania', 'georgia')
+invisible(lapply(tracking.states, 
+                 function(state) (all.state.dataset %>% 
+                                    collect.data(state) ->> 
+                                    all.state.dataset)))
+```
+
+Set `current.state.name` for analysis.
+
+```{r}
+current.state.name <- 'georgia'
+all.state.dataset %>% get.state.data(current.state.name) %>% load.state.data()
+```
+
+
+### Estimate the probability for each candidate
+
+Note: to change the reference snapshot and the current snapshot to build the estimate,
+add/change the `index.ref` and `index.cur` arguments in `build.est`.
+
+To see the number of snapshots available in each state, 
+use `sapply(all.state.dataset, length)`.
+
+To see the time of a state's snapshot, 
+use `names(all.state.dataset[[current.state.name]])` (time in UTC) or 
+`to.EST(names(all.state.dataset[[current.state.name]]))` (time in EST).
+
+```{r}
+est <- build.est(all.state.dataset, current.state.name, )
+est[est$exp.remaining > 0,]
+```
+
+### Build the final range
+```{r}
+est %>% build.final.range() -> final.range
+final.range
+```
+
+
+## Saving the data
 ```{r}
 save.image("MultinomialCIProject2020.RData")
 ```
